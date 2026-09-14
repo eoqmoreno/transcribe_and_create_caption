@@ -14,14 +14,45 @@ from faster_whisper import WhisperModel
 # não tiver suporte a GPU, usa CPU automaticamente.
 DEFAULT_LANGUAGE = "pt"
 DEFAULT_DEVICE = "cpu"
+DEFAULT_INPUT_DIR = Path("template")
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 
 
 def check_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None:
         raise EnvironmentError(
-            "ffmpeg não encontrado. Instale o Homebrew em https://brew.sh e execute "
-            "'brew install ffmpeg'. Depois, abra um novo Terminal e tente novamente."
+            "ffmpeg não encontrado. Instale-o seguindo as instruções do README e "
+            "depois abra um novo terminal e tente novamente."
         )
+
+
+def find_video_in_template() -> Path:
+    if not DEFAULT_INPUT_DIR.exists():
+        raise FileNotFoundError(
+            f"A pasta '{DEFAULT_INPUT_DIR}' não existe. Crie-a e coloque um vídeo dentro."
+        )
+
+    videos = sorted(
+        path
+        for path in DEFAULT_INPUT_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+    if not videos:
+        extensions = ", ".join(sorted(VIDEO_EXTENSIONS))
+        raise FileNotFoundError(
+            f"Nenhum vídeo encontrado em '{DEFAULT_INPUT_DIR}'. "
+            f"Extensões aceitas: {extensions}."
+        )
+
+    if len(videos) > 1:
+        names = ", ".join(video.name for video in videos)
+        raise ValueError(
+            f"Mais de um vídeo encontrado em '{DEFAULT_INPUT_DIR}': {names}. "
+            "Deixe somente um vídeo na pasta ou informe o arquivo explicitamente."
+        )
+
+    return videos[0]
 
 
 def extract_audio(video_path: Path, audio_path: Path) -> None:
@@ -134,7 +165,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Transcrever vídeo MP4 com faster-whisper e gerar arquivo TXT"
     )
-    parser.add_argument("input", help="Arquivo de vídeo MP4 de entrada")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help="Arquivo de vídeo de entrada. Se omitido, usa o único vídeo em template/",
+    )
     parser.add_argument(
         "output",
         nargs="?",
@@ -165,7 +200,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    video_path = Path(args.input)
+    try:
+        video_path = Path(args.input) if args.input else find_video_in_template()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
 
     if args.output:
         output_path = Path(args.output)
