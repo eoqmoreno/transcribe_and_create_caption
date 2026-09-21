@@ -1,5 +1,6 @@
 ﻿import argparse
 import itertools
+import os
 import shutil
 import subprocess
 import sys
@@ -90,6 +91,39 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def compute_progress_percent(current: float, total: float) -> int:
+    if total <= 0:
+        return 0
+    percent = int((current / total) * 100)
+    return max(0, min(100, percent))
+
+
+def build_progress_bar(percent: int, width: int = 20) -> str:
+    filled = max(0, min(width, int((percent / 100) * width)))
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {percent}%"
+
+
+def get_audio_duration(audio_path: Path) -> float:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def write_transcript(segments, output_path: Path, include_timestamps: bool) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as output_file:
@@ -121,26 +155,50 @@ def write_srt(segments, output_path: Path) -> None:
             output_file.write(f"{index}\n{start} --> {end}\n{text}\n\n")
 
 
-def transcribe_audio(audio_path: Path, model_name: str, language: str, device: str):
+def transcribe_audio(audio_path: Path, model_name: str, language: str, device: str, compute_type: str = "int8", cpu_threads: int = 4):
     requested_device = device.lower().strip()
 
     try:
-        model = WhisperModel(model_name, device=requested_device)
+        model = WhisperModel(
+            model_name,
+            device=requested_device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+        )
     except Exception as exc:
         if requested_device != "cpu":
             print(f"Falha ao usar o dispositivo '{requested_device}': {exc}")
             print("Tentando novamente com CPU...")
-            model = WhisperModel(model_name, device="cpu")
+            model = WhisperModel(
+                model_name,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=cpu_threads,
+            )
         else:
             raise
 
+    total_duration = get_audio_duration(audio_path)
     segments_result = []
     error_holder = []
 
     def run_transcription() -> None:
         try:
             segments, _ = model.transcribe(str(audio_path), language=language)
-            segments_result.extend(list(segments))
+            last_percent = 0
+            for segment in segments:
+                segments_result.append(segment)
+                if total_duration > 0:
+                    percent = compute_progress_percent(segment.end, total_duration)
+                    if percent != last_percent:
+                        print(
+                            f"\r{build_progress_bar(percent)} - Transcrevendo...",
+                            end="",
+                            flush=True,
+                        )
+                        last_percent = percent
+            if total_duration > 0:
+                print(f"\r{build_progress_bar(100)} - Transcrevendo...", end="", flush=True)
         except Exception as exc:
             error_holder.append(exc)
 
@@ -149,10 +207,11 @@ def transcribe_audio(audio_path: Path, model_name: str, language: str, device: s
 
     spinner = itertools.cycle(["|", "/", "-", "\\"])
     while worker.is_alive():
-        print(f"\rTranscrevendo... {next(spinner)}", end="", flush=True)
+        if total_duration <= 0:
+            print(f"\rTranscrevendo... {next(spinner)}", end="", flush=True)
         time.sleep(0.1)
 
-    print("\rTranscrição concluída      ")
+    print("\rTranscrição concluída                ")
     worker.join()
 
     if error_holder:
@@ -191,6 +250,18 @@ def parse_args() -> argparse.Namespace:
         help="Dispositivo para inferência (padrão: cpu)",
     )
     parser.add_argument(
+        "--compute-type",
+        choices=["int8", "float16", "float32"],
+        default="int8",
+        help="Tipo de computação do modelo para ganhar velocidade em CPU (padrão: int8)",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=max(1, min(os.cpu_count() or 4, 8)),
+        help="Número de threads da CPU para inferência (padrão: até 8 núcleos ou o máximo da máquina)",
+    )
+    parser.add_argument(
         "--no-timestamps",
         action="store_true",
         help="Gerar saída sem timestamps",
@@ -227,7 +298,14 @@ def main() -> int:
         extract_audio(video_path, audio_path)
 
         print("Iniciando transcrição...")
-        segments = transcribe_audio(audio_path, args.model, args.language, args.device)
+        segments = transcribe_audio(
+            audio_path,
+            args.model,
+            args.language,
+            args.device,
+            compute_type=args.compute_type,
+            cpu_threads=args.threads,
+        )
 
         write_transcript(segments, output_path, include_timestamps=not args.no_timestamps)
         write_srt(segments, output_path)
